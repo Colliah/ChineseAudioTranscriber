@@ -1,26 +1,32 @@
 from __future__ import annotations
 
 import math
+import re
 import tempfile
 import time
 import wave
 from array import array
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable, Protocol, Sequence
+from typing import Any, Callable, Iterable, Literal, Protocol, Sequence
 
 from faster_whisper import WhisperModel
 from pydub import AudioSegment
 
+from core.nlp_analyzer import ContextAnalysis
+from core.sound_classifier import SoundEvent, events_overlapping_window
+from utils.audio_helper import AudioAnalyzer
+
 
 INITIAL_PROMPT = (
-    "Transcribe clearly with accurate punctuation. Context may include English "
-    "and Chinese. Convert all Chinese text to Simplified Chinese. Preserve "
-    "proper nouns when possible."
+    "Transcribe clearly with accurate punctuation. The audio may contain English, "
+    "Vietnamese, or Chinese. Convert all Chinese text to Simplified Chinese. "
+    "Preserve proper nouns when possible."
 )
 
 SUPPORTED_AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a"}
 MAX_AUDIO_SECONDS = 15 * 60
+LanguageCode = Literal["auto", "en", "vi", "zh"]
 
 
 @dataclass(frozen=True)
@@ -36,6 +42,9 @@ class TranscriptionResult:
     text: str
     duration_seconds: float
     audio_seconds: float
+    detected_language: str | None
+    language_probability: float | None
+    context_analyses: list[ContextAnalysis]
 
 
 @dataclass(frozen=True)
@@ -47,6 +56,8 @@ class WordInfo:
 
 ProgressCallback = Callable[[float], None]
 ChunkCallback = Callable[[TranscriptChunk], None]
+ContextAnalysisCallback = Callable[[ContextAnalysis], None]
+ContextAnalysisRunner = Callable[[list[dict[str, Any]]], ContextAnalysis | None]
 
 
 class AudioInputBackend(Protocol):
@@ -92,8 +103,14 @@ class FasterWhisperTranscriber:
     def transcribe_file(
         self,
         file_path: Path,
+        language: LanguageCode = "auto",
         on_progress: ProgressCallback | None = None,
         on_chunk: ChunkCallback | None = None,
+        sound_events: Sequence[SoundEvent] | None = None,
+        context_analysis_enabled: bool = False,
+        context_window_seconds: float = 60.0,
+        context_analysis_runner: ContextAnalysisRunner | None = None,
+        on_context_analysis: ContextAnalysisCallback | None = None,
     ) -> TranscriptionResult:
         audio_path, audio_seconds = self.validate_audio_file(file_path)
         started_at = time.perf_counter()
@@ -108,13 +125,20 @@ class FasterWhisperTranscriber:
             word_timestamps=True,
             initial_prompt=self.initial_prompt,
             beam_size=5,
+            language=None if language == "auto" else language,
         )
 
         chunks = self._consume_segments(
             segments=segments,
+            audio_path=audio_path,
             audio_seconds=audio_seconds,
             on_progress=on_progress,
             on_chunk=on_chunk,
+            sound_events=sound_events or [],
+            context_analysis_enabled=context_analysis_enabled,
+            context_window_seconds=context_window_seconds,
+            context_analysis_runner=context_analysis_runner,
+            on_context_analysis=on_context_analysis,
         )
         elapsed = time.perf_counter() - started_at
         return TranscriptionResult(
@@ -122,10 +146,14 @@ class FasterWhisperTranscriber:
             text=self.format_chunks(chunks),
             duration_seconds=elapsed,
             audio_seconds=audio_seconds,
+            detected_language=getattr(_info, "language", None),
+            language_probability=getattr(_info, "language_probability", None),
+            context_analyses=getattr(self, "_last_context_analyses", []),
         )
 
     def listen_once(
         self,
+        language: LanguageCode = "auto",
         silence_seconds: float = 1.0,
         max_record_seconds: float = 60.0,
         sample_rate: int = 16_000,
@@ -140,7 +168,7 @@ class FasterWhisperTranscriber:
             vad_threshold=vad_threshold,
         )
         try:
-            return self.transcribe_file(wav_path)
+            return self.transcribe_file(wav_path, language=language)
         finally:
             wav_path.unlink(missing_ok=True)
 
@@ -167,13 +195,24 @@ class FasterWhisperTranscriber:
     def _consume_segments(
         self,
         segments: Iterable[object],
+        audio_path: Path,
         audio_seconds: float,
         on_progress: ProgressCallback | None,
         on_chunk: ChunkCallback | None,
+        sound_events: Sequence[SoundEvent],
+        context_analysis_enabled: bool,
+        context_window_seconds: float,
+        context_analysis_runner: ContextAnalysisRunner | None,
+        on_context_analysis: ContextAnalysisCallback | None,
     ) -> list[TranscriptChunk]:
         chunks: list[TranscriptChunk] = []
         pending_words: list[WordInfo] = []
         last_end = 0.0
+        conversation_buffer: list[dict[str, Any]] = []
+        buffered_duration = 0.0
+        context_analyses: list[ContextAnalysis] = []
+        audio_analyzer = AudioAnalyzer() if context_analysis_enabled else None
+        self._last_context_analyses = context_analyses
 
         for segment in segments:
             words = self._extract_words(segment)
@@ -182,10 +221,26 @@ class FasterWhisperTranscriber:
                     pending_words.append(word)
                     last_end = max(last_end, word.end)
                     if self._should_flush_chunk(pending_words):
-                        chunk = self._words_to_chunk(pending_words)
+                        chunk = self._words_to_chunk(pending_words, sound_events)
                         chunks.append(chunk)
                         if on_chunk is not None:
                             on_chunk(chunk)
+                        buffered_duration = self._append_context_buffer(
+                            conversation_buffer,
+                            buffered_duration,
+                            chunk,
+                            audio_path,
+                            audio_analyzer,
+                            sound_events,
+                        )
+                        buffered_duration = self._maybe_run_context_analysis(
+                            conversation_buffer,
+                            buffered_duration,
+                            context_window_seconds,
+                            context_analysis_runner,
+                            on_context_analysis,
+                            context_analyses,
+                        )
                         pending_words = []
             else:
                 text = str(getattr(segment, "text", "")).strip()
@@ -197,22 +252,111 @@ class FasterWhisperTranscriber:
                     chunks.append(chunk)
                     if on_chunk is not None:
                         on_chunk(chunk)
+                    buffered_duration = self._append_context_buffer(
+                        conversation_buffer,
+                        buffered_duration,
+                            chunk,
+                            audio_path,
+                            audio_analyzer,
+                            sound_events,
+                        )
+                    buffered_duration = self._maybe_run_context_analysis(
+                        conversation_buffer,
+                        buffered_duration,
+                        context_window_seconds,
+                        context_analysis_runner,
+                        on_context_analysis,
+                        context_analyses,
+                    )
                     last_end = max(last_end, end)
 
             if on_progress is not None:
                 on_progress(min(last_end, audio_seconds))
 
         if pending_words:
-            chunk = self._words_to_chunk(pending_words)
+            chunk = self._words_to_chunk(pending_words, sound_events)
             chunks.append(chunk)
             if on_chunk is not None:
                 on_chunk(chunk)
+            buffered_duration = self._append_context_buffer(
+                conversation_buffer,
+                buffered_duration,
+                chunk,
+                audio_path,
+                audio_analyzer,
+                sound_events,
+            )
+            self._maybe_run_context_analysis(
+                conversation_buffer,
+                buffered_duration,
+                context_window_seconds,
+                context_analysis_runner,
+                on_context_analysis,
+                context_analyses,
+            )
             last_end = max(last_end, chunk.end)
+
+        self._maybe_run_context_analysis(
+            conversation_buffer,
+            buffered_duration,
+            context_window_seconds,
+            context_analysis_runner,
+            on_context_analysis,
+            context_analyses,
+            force=True,
+        )
 
         if on_progress is not None:
             on_progress(audio_seconds)
 
         return chunks
+
+    def _append_context_buffer(
+        self,
+        conversation_buffer: list[dict[str, Any]],
+        buffered_duration: float,
+        chunk: TranscriptChunk,
+        audio_path: Path,
+        audio_analyzer: AudioAnalyzer | None,
+        sound_events: Sequence[SoundEvent],
+    ) -> float:
+        if audio_analyzer is None:
+            return buffered_duration
+
+        audio_features = audio_analyzer.analyze_segment(audio_path, chunk.start, chunk.end)
+        chunk_events = events_overlapping_window(sound_events, chunk.start, chunk.end)
+        conversation_buffer.append(
+            {
+                "timestamp": f"[{format_timestamp(chunk.start)} -> {format_timestamp(chunk.end)}]",
+                "text": chunk.text,
+                "audio_meta": audio_features.to_meta_text(),
+                "events": format_context_events(chunk_events, chunk.text),
+            }
+        )
+        return buffered_duration + max(0.0, chunk.end - chunk.start)
+
+    def _maybe_run_context_analysis(
+        self,
+        conversation_buffer: list[dict[str, Any]],
+        buffered_duration: float,
+        context_window_seconds: float,
+        context_analysis_runner: ContextAnalysisRunner | None,
+        on_context_analysis: ContextAnalysisCallback | None,
+        context_analyses: list[ContextAnalysis],
+        force: bool = False,
+    ) -> float:
+        if not conversation_buffer or context_analysis_runner is None:
+            return buffered_duration
+        if not force and buffered_duration < context_window_seconds:
+            return buffered_duration
+
+        analysis = context_analysis_runner(list(conversation_buffer))
+        conversation_buffer.clear()
+        if analysis is not None:
+            context_analyses.append(analysis)
+            if on_context_analysis is not None:
+                on_context_analysis(analysis)
+        return 0.0
 
     @staticmethod
     def _extract_words(segment: object) -> list[WordInfo]:
@@ -238,8 +382,11 @@ class FasterWhisperTranscriber:
         return duration >= 5.0 and has_sentence_end
 
     @staticmethod
-    def _words_to_chunk(words: Sequence[WordInfo]) -> TranscriptChunk:
-        text = " ".join(word.word.strip() for word in words).strip()
+    def _words_to_chunk(
+        words: Sequence[WordInfo],
+        sound_events: Sequence[SoundEvent] = (),
+    ) -> TranscriptChunk:
+        text = build_interpolated_text(words, sound_events)
         text = (
             text.replace(" ,", ",")
             .replace(" .", ".")
@@ -359,6 +506,82 @@ def normalize_simplified_chinese(text: str) -> str:
     except ImportError:
         return text
     return str(convert(text, "zh-cn"))
+
+
+def build_interpolated_text(
+    words: Sequence[WordInfo],
+    sound_events: Sequence[SoundEvent],
+) -> str:
+    """Insert emotion-cue tags into the exact word-timestamp position."""
+    if not words:
+        return ""
+
+    emotion_events = [
+        event
+        for event in events_overlapping_window(sound_events, words[0].start, words[-1].end)
+        if event.category == "emotion-cue"
+    ]
+    if not emotion_events:
+        return " ".join(word.word.strip() for word in words).strip()
+
+    insertions: dict[int, list[SoundEvent]] = {}
+    for event in sorted(emotion_events, key=lambda item: (item.start, item.label)):
+        position = find_emotion_insert_position(words, event.start)
+        insertions.setdefault(position, []).append(event)
+
+    tokens: list[str] = []
+    for index, word in enumerate(words):
+        tokens.extend(emotion_tag_from_event(event) for event in insertions.get(index, []))
+        tokens.append(word.word.strip())
+    tokens.extend(emotion_tag_from_event(event) for event in insertions.get(len(words), []))
+    return " ".join(token for token in tokens if token).strip()
+
+
+def find_emotion_insert_position(words: Sequence[WordInfo], timestamp: float) -> int:
+    """Return the token index where an event timestamp belongs."""
+    if timestamp <= words[0].start:
+        return 0
+
+    for index in range(len(words) - 1):
+        current_word = words[index]
+        next_word = words[index + 1]
+        if current_word.end <= timestamp <= next_word.start:
+            return index + 1
+        if current_word.start <= timestamp <= current_word.end:
+            midpoint = current_word.start + ((current_word.end - current_word.start) / 2)
+            return index if timestamp < midpoint else index + 1
+
+    last_word = words[-1]
+    if last_word.start <= timestamp <= last_word.end:
+        midpoint = last_word.start + ((last_word.end - last_word.start) / 2)
+        return len(words) - 1 if timestamp < midpoint else len(words)
+    return len(words)
+
+
+def emotion_tag_from_event(event: SoundEvent) -> str:
+    label = event.label.split(",", maxsplit=1)[0].strip()
+    label = re.sub(r"[^A-Za-z0-9 _-]+", "", label).strip()
+    label = label.replace(" ", "")
+    return f"[{label or 'Emotion'}]"
+
+
+def extract_event_tokens(text: str) -> list[str]:
+    """Extract bracketed event markers such as [Laughter] or [Sigh]."""
+    return [token.strip() for token in re.findall(r"\[([^\]]+)\]", text) if token.strip()]
+
+
+def format_context_events(events: Sequence[SoundEvent], text: str) -> list[str] | str:
+    """Format raw-audio sound events plus any explicit Whisper event tokens."""
+    formatted = [
+        (
+            f"{event.label} ({event.category}, score={event.score:.2f}, "
+            f"{format_timestamp(event.start)}->{format_timestamp(event.end)})"
+        )
+        for event in events
+    ]
+    if not formatted:
+        formatted.extend(f"Transcript token: {token}" for token in extract_event_tokens(text))
+    return formatted if formatted else "None"
 
 
 class PyAudioInputBackend:

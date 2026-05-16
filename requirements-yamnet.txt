@@ -1,0 +1,6 @@
+# YAMNet via TensorFlow Hub currently needs a TensorFlow-supported Python.
+# Use Python 3.10-3.13 on Windows CPU; Python 3.14 is not a good target for this optional stack yet.
+tensorflow>=2.21,<2.22
+tensorflow-hub>=0.16.1
+# tensorflow-hub 0.16.1 still imports pkg_resources, removed by newer setuptools.
+setuptools<81

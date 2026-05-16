@@ -5,3 +5,5 @@ pydub>=0.25.1
 sounddevice>=0.5.0
 audioop-lts>=0.2.2; python_version >= "3.13"
 zhconv>=1.4.3
+librosa>=0.10.2
+requests>=2.32.0
